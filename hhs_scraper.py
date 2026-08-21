@@ -1,20 +1,22 @@
 #!/usr/bin/env python3
 """
-CMS Risk Adjustment scraper (config-driven, GitHub Actions ready)
------------------------------------------------------------------
-All settings live in config.toml (scraping targets, CSV path, alert method).
+HHS Risk Adjustment DIY Software scraper (config-driven, GitHub Actions ready)
+-----------------------------------------------------------------------------
+Watches the CMS Marketplace "Regulations and Guidance" page for the annual
+HHS-Developed Risk Adjustment Model Algorithm "Do It Yourself (DIY)" Software
+release (one .zip per benefit year) and alerts when a new one is posted.
 
-Behaviour:
+Behaviour (identical to the CMS watcher, only the SCRAPING logic differs):
   1. Loads config.toml.
   2. Loads the existing CSV of already-seen files (if present).
-  3. Scrapes the site for the current list of files.
+  3. Scrapes the page for DIY-software file links (single-stage, keyword match).
   4. Keeps only the files NOT already in the CSV (new drops).
   5. Stamps each new file with the date it was found.
   6. Appends the new rows to the CSV.
   7. Alerts with details of ONLY the new files (Teams / SMTP / Outlook).
 
-Run from a terminal:  python cms_scraper.py [path/to/config.toml]
-On GitHub Actions:     python cms_scraper.py   (uses cloudscraper + Teams)
+Run from a terminal:  python hhs_scraper.py [path/to/config.toml]
+On GitHub Actions:     python hhs_scraper.py   (uses cloudscraper + Teams)
 """
 
 import os
@@ -69,68 +71,68 @@ def get_html(session, url, cfg):
             time.sleep(2 * attempt)
 
 
-def find_year_directories(html, cfg):
-    """From the main page, return [(year, label, url), ...] for each directory
-    link matching the configured year_link_regex."""
-    base = cfg["scraping"]["base_url"]
-    year_re = re.compile(cfg["scraping"]["year_link_regex"], re.IGNORECASE)
-    soup = BeautifulSoup(html, "html.parser")
-    dirs, seen = [], set()
-    for a in soup.find_all("a", href=True):
-        label = a.get_text(strip=True)
-        m = year_re.match(label)
-        if m:
-            url = urljoin(base, a["href"])
-            if url not in seen:
-                seen.add(url)
-                dirs.append((m.group(1), label, url))
-    dirs.sort(key=lambda x: x[0], reverse=True)  # newest first
-    return dirs
+def scrape_matching_entries(html, page_url, cfg):
+    """Single-stage scrape for HHS DIY software.
 
+    Finds every file link (by extension) whose own text OR its surrounding
+    line matches the configured keyword_regex (the DIY-software wording),
+    then extracts the benefit year from that text.
+    Returns list of {year, directory, file_name, file_ext, file_url}.
+    """
+    s = cfg["scraping"]
+    exts = tuple(s["file_extensions"])
+    keyword_re = re.compile(s["keyword_regex"], re.IGNORECASE)
+    year_re = re.compile(s["year_regex"])
+    directory_label = s.get("directory_label", "HHS DIY Software")
 
-def _record(a, page_url, exts):
-    """Build a file record from an <a> tag, or None if it isn't a file link."""
-    href = a["href"]
-    name = a.get_text(strip=True)
-    if not name:
-        return None
-    low = href.lower()
-    is_file = low.endswith(tuple(exts)) or "/files/" in low or "/document/" in low
-    if not is_file:
-        return None
-    ext = next((e for e in exts if low.endswith(e)), "")
-    return {"name": name, "url": urljoin(page_url, href), "ext": ext.lstrip(".")}
-
-
-def scrape_downloads(html, page_url, cfg):
-    """From a year's page, return list of {name, url, ext} in the Downloads
-    section. Falls back to all file-type links if no Downloads heading found."""
-    exts = cfg["scraping"]["file_extensions"]
     soup = BeautifulSoup(html, "html.parser")
     recs, seen = [], set()
 
-    # Prefer links under a "Downloads" heading, stopping at the next heading.
-    heading = soup.find(lambda t: t.name in ("h2", "h3", "h4")
-                        and "download" in t.get_text(strip=True).lower())
-    if heading:
-        stop_levels = {"h1", "h2", "h3", "h4"}
-        for el in heading.find_all_next():
-            if el.name in stop_levels and el is not heading:
-                break
-            if el.name == "a" and el.has_attr("href"):
-                rec = _record(el, page_url, exts)
-                if rec and rec["url"] not in seen:
-                    seen.add(rec["url"])
-                    recs.append(rec)
-        if recs:
-            return recs
-
-    # Fallback: any file-type link anywhere on the page.
     for a in soup.find_all("a", href=True):
-        rec = _record(a, page_url, exts)
-        if rec and rec["url"] not in seen:
-            seen.add(rec["url"])
-            recs.append(rec)
+        href = a["href"]
+        low = href.lower()
+        is_file = low.endswith(exts) or "/files/" in low or "/document/" in low
+        if not is_file:
+            continue
+
+        # Build the text to match against: the link text plus its containing
+        # line (li/p/td/div) so we catch the case where the anchor is short
+        # (e.g. "ZIP") and the title/date sit in the surrounding text.
+        anchor_text = a.get_text(" ", strip=True)
+        parent = a.find_parent(["li", "p", "td", "div"])
+        context = parent.get_text(" ", strip=True) if parent else anchor_text
+        haystack = f"{anchor_text} | {context}"
+
+        if not keyword_re.search(haystack):
+            continue
+
+        # Prefer the full line as the title (has date + description); fall back
+        # to anchor text if the line is somehow empty.
+        title = context if len(context) >= len(anchor_text) else anchor_text
+        title = " ".join(title.split())
+        # Drop a trailing bare link label like "ZIP" / "(ZIP)" / "PDF".
+        title = re.sub(r"\s*\(?(?:zip|pdf)\)?\s*$", "", title, flags=re.IGNORECASE).strip()
+
+        # Prefer the "NNNN Benefit Year" number (the model year) over the
+        # publication-date year, since CMS may post a benefit year's software
+        # in the following calendar year.
+        by = re.search(r"(20\d{2})\s+Benefit\s+Year", title, re.IGNORECASE)
+        if by:
+            year = by.group(1)
+        else:
+            ym = year_re.search(title) or year_re.search(haystack)
+            year = ym.group(1) if ym else ""
+
+        url = urljoin(page_url, href)
+        key = url
+        if key in seen:
+            continue
+        seen.add(key)
+
+        ext = next((e for e in exts if low.endswith(e)), "")
+        recs.append({"year": year, "directory": directory_label,
+                     "file_name": title, "file_ext": ext.lstrip("."),
+                     "file_url": url})
     return recs
 
 
@@ -163,14 +165,14 @@ def load_existing(csv_file):
 # ---------------------------------------------------------------------------
 def build_alert_body(new_rows, cfg):
     """Plain-text body listing ONLY the new files, grouped by year."""
-    lines = [f"{len(new_rows)} new file(s) posted on the CMS Risk Adjustment page.",
-             ""]
+    source = cfg["alert"].get("source_label", "the watched page")
+    lines = [f"{len(new_rows)} new file(s) posted on {source}.", ""]
     current_year = None
     for r in sorted(new_rows, key=lambda x: (x["year"], x["file_name"]),
                     reverse=True):
         if r["year"] != current_year:
             current_year = r["year"]
-            lines.append(f"{r['directory']}:")
+            lines.append(f"{r['year']} - {r['directory']}:")
         lines.append(f"  - {r['file_name']} "
                      f"({r['file_ext'] or 'file'})  |  found {r['date_found']}")
         lines.append(f"    {r['file_url']}")
@@ -262,40 +264,26 @@ def main(config_path="config.toml"):
     main_url = cfg["scraping"]["main_url"]
 
     # cloudscraper mimics a real browser TLS/JS challenge -> avoids Akamai 403.
-    # Exposes the same .get() API as requests.Session().
     session = cloudscraper.create_scraper()
 
     # 1) Load what we already know
     existing_rows, seen_keys = load_existing(csv_file)
     print(f"[1/4] Existing CSV: {len(existing_rows)} file(s) already recorded.")
 
-    # 2) Scrape current state of the site
-    print(f"[2/4] Fetching main page: {main_url}")
+    # 2) Scrape current state of the page (single stage)
+    print(f"[2/4] Fetching page: {main_url}")
     try:
-        main_html = get_html(session, main_url, cfg)
+        html = get_html(session, main_url, cfg)
     except requests.RequestException as e:
-        print(f"[ERROR] Could not load main page: {e}")
+        print(f"[ERROR] Could not load page: {e}")
         print("If this is a 403, CMS/Akamai is blocking the request. "
               "cloudscraper usually handles it; if not, try a Playwright fetch.")
         sys.exit(1)
 
-    dirs = find_year_directories(main_html, cfg)
-    print(f"      Found {len(dirs)} year directories: "
-          f"{', '.join(y for y, _, _ in dirs)}")
-
-    scraped = []
-    for i, (year, label, url) in enumerate(dirs, 1):
-        print(f"      ({i}/{len(dirs)}) {label}")
-        try:
-            files = scrape_downloads(get_html(session, url, cfg), url, cfg)
-        except requests.RequestException as e:
-            print(f"        [warn] skipped ({e})")
-            files = []
-        for fl in files:
-            scraped.append({"year": year, "directory": label,
-                            "file_name": fl["name"], "file_ext": fl["ext"],
-                            "file_url": fl["url"]})
-        time.sleep(cfg["scraping"]["request_delay"])  # be polite
+    scraped = scrape_matching_entries(html, main_url, cfg)
+    years = sorted({r["year"] for r in scraped if r["year"]}, reverse=True)
+    print(f"      Matched {len(scraped)} DIY file(s) across years: "
+          f"{', '.join(years) if years else '(none)'}")
 
     # 3) Keep only files not already in the CSV
     today = date.today().isoformat()
