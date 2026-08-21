@@ -76,7 +76,9 @@ def scrape_matching_entries(html, page_url, cfg):
 
     Finds every file link (by extension) whose own text OR its surrounding
     line matches the configured keyword_regex (the DIY-software wording),
-    then extracts the benefit year from that text.
+    then extracts the benefit year from that text.  Each dated release is its
+    own record (multiple releases per benefit year are kept separately, since
+    they have distinct URLs).
     Returns list of {year, directory, file_name, file_ext, file_url}.
     """
     s = cfg["scraping"]
@@ -164,19 +166,20 @@ def load_existing(csv_file):
 # Alerts (Teams / SMTP / Outlook)
 # ---------------------------------------------------------------------------
 def build_alert_body(new_rows, cfg):
-    """Plain-text body listing ONLY the new files, grouped by year."""
+    """Plain-text body listing ONLY the new files - one separate entry per
+    dated release (multiple releases per benefit year are listed individually,
+    never collapsed into a single per-year record)."""
     source = cfg["alert"].get("source_label", "the watched page")
     lines = [f"{len(new_rows)} new file(s) posted on {source}.", ""]
-    current_year = None
+    # Sort newest first by (benefit year, title); each row is its own block.
     for r in sorted(new_rows, key=lambda x: (x["year"], x["file_name"]),
                     reverse=True):
-        if r["year"] != current_year:
-            current_year = r["year"]
-            lines.append(f"{r['year']} - {r['directory']}:")
-        lines.append(f"  - {r['file_name']} "
-                     f"({r['file_ext'] or 'file'})  |  found {r['date_found']}")
+        lines.append(f"- {r['file_name']}")
+        lines.append(f"    Benefit year: {r['year'] or 'n/a'}"
+                     f"  |  {r['file_ext'] or 'file'}  |  found {r['date_found']}")
         lines.append(f"    {r['file_url']}")
-    lines += ["", "Page: " + cfg["scraping"]["main_url"]]
+        lines.append("")  # blank line between entries for readability
+    lines += ["Page: " + cfg["scraping"]["main_url"]]
     return "\n".join(lines)
 
 
