@@ -1,63 +1,49 @@
 # =============================================================================
-# CMS Risk Adjustment Watcher - configuration
-# Edit this file to change what is scraped, where data is stored, and how
-# alerts are delivered. No need to touch the Python code.
+# HHS Risk Adjustment DIY Software Watcher - configuration
 # =============================================================================
 
 [scraping]
-# Root of the CMS site (used to resolve relative links)
 base_url = "https://www.cms.gov"
+main_url = "https://www.cms.gov/marketplace/resources/regulations-guidance"
 
-# The page to watch
-main_url = "https://www.cms.gov/medicare/payment/medicare-advantage-rates-statistics/risk-adjustment"
+# Match only the DIY-software entries (the "Do It Yourself" / "DIY" wording).
+keyword_regex = '(?i)(do it yourself|\bDIY\b).{0,60}software'
 
-# Only follow directory links whose text matches this pattern.
-# Default = "[Year] Model Software/ICD-10 Mappings" (excludes ICD-9 / 2015).
-year_link_regex = '^\s*(20\d{2})\s+Model Software\s*/\s*ICD-10'
+# Extract the benefit year (first 20xx in the entry text)
+year_regex = '\b(20\d{2})\b'
 
-# File types treated as downloadable files inside each year's Downloads section
-file_extensions = [".zip", ".csv", ".xlsx", ".xls", ".txt", ".pdf", ".sas", ".py"]
+# DIY software ships as .zip
+file_extensions = [".zip"]
 
-# Network retries and politeness delay (seconds) between page fetches
+# Written into the CSV "directory" column (kept for schema parity)
+directory_label = "HHS DIY Software"
+
 retries = 3
 request_delay = 1
 timeout = 30
 
 
 [storage]
-# CSV that holds all files seen so far (single source of truth).
-# On GitHub Actions this file is committed back each run to persist state.
-csv_file = "cms_files.csv"
+csv_file = "hhs_files.csv"
 
 
 [alert]
-# Turn alerting on/off without removing config
 enabled = true
-
-# Delivery method:
-#   "teams"   -> Teams Workflows Incoming Webhook (uses env TEAMS_WEBHOOK_URL)
-#   "smtp"    -> external SMTP e.g. SendGrid (uses env SMTP_USER / SMTP_PASS)
-#   "outlook" -> local desktop Outlook (only works on your machine)
 send_via = "teams"
-
-# Recipients - used only by smtp/outlook. Kept here for reference/logging.
 to = ["harsh.bansal@evolenthealth.com"]
-
-# Title shown at the top of the alert
-subject = "New CMS Risk Adjustment file(s) posted"
+subject = "New HHS DIY Risk Adjustment Software posted"
+source_label = "the CMS Marketplace Regulations & Guidance page (HHS DIY Software)"
 
 
 [alert.smtp]
-# Only used when send_via = "smtp". Ignored for the Teams setup.
 host = "smtp.sendgrid.net"
 port = 587
-from_address = "cms-watcher@yourdomain.com"
+from_address = "hhs-watcher@yourdomain.com"
 use_tls = true
 use_auth = true
 
 
 [http]
-# Browser-like headers so CMS/Akamai does not reject the request
 user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 accept = "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8"
 accept_language = "en-US,en;q=0.9"
