@@ -1,0 +1,39 @@
+name: hhs_watcher
+
+on:
+  schedule:
+    - cron: "0 13 */2 * *"     # every 2 days at 13:00 UTC = 9 AM ET
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0          # full history so rebase/push works
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run watcher
+        env:
+          TEAMS_WEBHOOK_URL: ${{ secrets.TEAMS_WEBHOOK_URL }}
+        run: python hhs_scraper.py
+
+      - name: Persist CSV state
+        run: |
+          git config user.name  "hhs_watcher"
+          git config user.email "bot@users.noreply.github.com"
+          git add hhs_files.csv
+          git commit -m "update state $(date -u +%F)" || { echo "no changes"; exit 0; }
+          git fetch origin main
+          git rebase origin/main || git rebase --abort
+          git push origin HEAD:main
