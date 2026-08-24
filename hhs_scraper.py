@@ -2,18 +2,18 @@
 """
 HHS Risk Adjustment DIY Software scraper (config-driven, GitHub Actions ready)
 -----------------------------------------------------------------------------
-Watches the CMS Marketplace "Regulations and Guidance" page for the annual
+Watches the CMS Marketplace "Regulations and Guidance" page for every dated
 HHS-Developed Risk Adjustment Model Algorithm "Do It Yourself (DIY)" Software
-release (one .zip per benefit year) and alerts when a new one is posted.
+release and alerts when a new one is posted.
 
 Behaviour (identical to the CMS watcher, only the SCRAPING logic differs):
   1. Loads config.toml.
   2. Loads the existing CSV of already-seen files (if present).
-  3. Scrapes the page for DIY-software file links (single-stage, keyword match).
-  4. Keeps only the files NOT already in the CSV (new drops).
-  5. Stamps each new file with the date it was found.
+  3. Scrapes the page for DIY-software entries (single-stage, keyword match).
+  4. Keeps only the entries NOT already in the CSV (new drops).
+  5. Stamps each new entry with the date it was found.
   6. Appends the new rows to the CSV.
-  7. Alerts with details of ONLY the new files (Teams / SMTP / Outlook).
+  7. Alerts with details of ONLY the new entries (Teams / SMTP / Outlook).
 
 Run from a terminal:  python hhs_scraper.py [path/to/config.toml]
 On GitHub Actions:     python hhs_scraper.py   (uses cloudscraper + Teams)
@@ -74,11 +74,15 @@ def get_html(session, url, cfg):
 def scrape_matching_entries(html, page_url, cfg):
     """Single-stage scrape for HHS DIY software.
 
-    Finds every file link (by extension) whose own text OR its surrounding
-    line matches the configured keyword_regex (the DIY-software wording),
-    then extracts the benefit year from that text.  Each dated release is its
-    own record (multiple releases per benefit year are kept separately, since
-    they have distinct URLs).
+    Finds every downloadable file link whose entry line matches the DIY
+    keyword, cleans the title to "date + <NNNN Benefit Year ...> Software"
+    (dropping trailing sub-items like Instructions/Technical/SAS), extracts
+    the benefit year, and returns ONE record per dated entry.
+
+    A single entry's <li> may hold several downloads (the DIY zip plus an
+    Instructions PDF, a Technical XLSX and a SAS-version zip); we keep just
+    one record per entry and prefer the DIY zip over the SAS zip.
+
     Returns list of {year, directory, file_name, file_ext, file_url}.
     """
     s = cfg["scraping"]
@@ -88,7 +92,7 @@ def scrape_matching_entries(html, page_url, cfg):
     directory_label = s.get("directory_label", "HHS DIY Software")
 
     soup = BeautifulSoup(html, "html.parser")
-    recs, seen = [], set()
+    by_title = {}   # cleaned_title -> record (dedupe per dated entry)
 
     for a in soup.find_all("a", href=True):
         href = a["href"]
@@ -97,27 +101,27 @@ def scrape_matching_entries(html, page_url, cfg):
         if not is_file:
             continue
 
-        # Build the text to match against: the link text plus its containing
-        # line (li/p/td/div) so we catch the case where the anchor is short
-        # (e.g. "ZIP") and the title/date sit in the surrounding text.
+        # The link's whole entry line (li/p/td) carries the date + heading.
         anchor_text = a.get_text(" ", strip=True)
         parent = a.find_parent(["li", "p", "td", "div"])
         context = parent.get_text(" ", strip=True) if parent else anchor_text
         haystack = f"{anchor_text} | {context}"
 
+        # Only entries about the DIY software.
         if not keyword_re.search(haystack):
             continue
 
-        # Prefer the full line as the title (has date + description); fall back
-        # to anchor text if the line is somehow empty.
-        title = context if len(context) >= len(anchor_text) else anchor_text
-        title = " ".join(title.split())
-        # Drop a trailing bare link label like "ZIP" / "(ZIP)" / "PDF".
-        title = re.sub(r"\s*\(?(?:zip|pdf)\)?\s*$", "", title, flags=re.IGNORECASE).strip()
+        raw = context if len(context) >= len(anchor_text) else anchor_text
+        raw = " ".join(raw.split())
 
-        # Prefer the "NNNN Benefit Year" number (the model year) over the
-        # publication-date year, since CMS may post a benefit year's software
-        # in the following calendar year.
+        # Keep only "date + <NNNN Benefit Year ... Do It Yourself (DIY)> Software"
+        # and drop the trailing sub-items (Instructions/Technical/SAS/etc.).
+        m = re.search(r"^(.*?(?:do it yourself|\bdiy\b).{0,60}?software)\b",
+                      raw, re.IGNORECASE)
+        title = (m.group(1) if m else raw).strip()
+
+        # Benefit year: prefer the "NNNN Benefit Year" number over any other
+        # 20xx (CMS may post a benefit year's software in a later calendar year).
         by = re.search(r"(20\d{2})\s+Benefit\s+Year", title, re.IGNORECASE)
         if by:
             year = by.group(1)
@@ -125,16 +129,23 @@ def scrape_matching_entries(html, page_url, cfg):
             ym = year_re.search(title) or year_re.search(haystack)
             year = ym.group(1) if ym else ""
 
-        url = urljoin(page_url, href)
-        key = url
-        if key in seen:
-            continue
-        seen.add(key)
-
         ext = next((e for e in exts if low.endswith(e)), "")
-        recs.append({"year": year, "directory": directory_label,
-                     "file_name": title, "file_ext": ext.lstrip("."),
-                     "file_url": url})
+        url = urljoin(page_url, href)
+
+        # Prefer the DIY download over a SAS-version download in the same entry.
+        is_sas = ("sas" in low) or ("sas" in anchor_text.lower())
+        score = 0 if is_sas else 1
+
+        prev = by_title.get(title)
+        if prev is None or score > prev["_score"]:
+            by_title[title] = {"year": year, "directory": directory_label,
+                               "file_name": title, "file_ext": ext.lstrip("."),
+                               "file_url": url, "_score": score}
+
+    recs = []
+    for r in by_title.values():
+        r.pop("_score", None)
+        recs.append(r)
     return recs
 
 
@@ -146,7 +157,7 @@ CSV_COLUMNS = ["year", "directory", "file_name", "file_ext",
 
 
 def _key(url, year, name):
-    """Unique identity for a file: prefer URL, else year|name."""
+    """Unique identity for an entry: prefer URL, else year|name."""
     return url.strip() if url and url.strip() else f"{year}|{name}".strip()
 
 
@@ -166,12 +177,11 @@ def load_existing(csv_file):
 # Alerts (Teams / SMTP / Outlook)
 # ---------------------------------------------------------------------------
 def build_alert_body(new_rows, cfg):
-    """Plain-text body listing ONLY the new files - one separate entry per
+    """Plain-text body listing ONLY the new entries - one separate block per
     dated release (multiple releases per benefit year are listed individually,
     never collapsed into a single per-year record)."""
     source = cfg["alert"].get("source_label", "the watched page")
     lines = [f"{len(new_rows)} new file(s) posted on {source}.", ""]
-    # Sort newest first by (benefit year, title); each row is its own block.
     for r in sorted(new_rows, key=lambda x: (x["year"], x["file_name"]),
                     reverse=True):
         lines.append(f"- {r['file_name']}")
@@ -271,7 +281,7 @@ def main(config_path="config.toml"):
 
     # 1) Load what we already know
     existing_rows, seen_keys = load_existing(csv_file)
-    print(f"[1/4] Existing CSV: {len(existing_rows)} file(s) already recorded.")
+    print(f"[1/4] Existing CSV: {len(existing_rows)} entry(ies) already recorded.")
 
     # 2) Scrape current state of the page (single stage)
     print(f"[2/4] Fetching page: {main_url}")
@@ -285,10 +295,10 @@ def main(config_path="config.toml"):
 
     scraped = scrape_matching_entries(html, main_url, cfg)
     years = sorted({r["year"] for r in scraped if r["year"]}, reverse=True)
-    print(f"      Matched {len(scraped)} DIY file(s) across years: "
+    print(f"      Matched {len(scraped)} DIY entry(ies) across years: "
           f"{', '.join(years) if years else '(none)'}")
 
-    # 3) Keep only files not already in the CSV
+    # 3) Keep only entries not already in the CSV
     today = date.today().isoformat()
     new_rows = []
     for r in scraped:
@@ -298,11 +308,11 @@ def main(config_path="config.toml"):
             r["date_found"] = today
             new_rows.append(r)
 
-    print(f"[3/4] New files found: {len(new_rows)}")
+    print(f"[3/4] New entries found: {len(new_rows)}")
     for r in new_rows:
         print(f"        + [{r['year']}] {r['file_name']} ({r['date_found']})")
 
-    # 4) Append new rows to the CSV + alert with ONLY the new files
+    # 4) Append new rows to the CSV + alert with ONLY the new entries
     if new_rows:
         write_header = not os.path.exists(csv_file)
         with open(csv_file, "a", newline="", encoding="utf-8") as f:
@@ -314,7 +324,7 @@ def main(config_path="config.toml"):
         print(f"[4/4] Appended {len(new_rows)} new row(s) to {csv_file}.")
         send_alert(cfg["alert"]["subject"], build_alert_body(new_rows, cfg), cfg)
     else:
-        print(f"[4/4] No new files. {csv_file} left unchanged. No alert sent.")
+        print(f"[4/4] No new entries. {csv_file} left unchanged. No alert sent.")
 
 
 if __name__ == "__main__":
