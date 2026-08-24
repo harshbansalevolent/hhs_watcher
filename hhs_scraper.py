@@ -6,15 +6,6 @@ Watches the CMS Marketplace "Regulations and Guidance" page for every dated
 HHS-Developed Risk Adjustment Model Algorithm "Do It Yourself (DIY)" Software
 release and alerts when a new one is posted.
 
-Behaviour (identical to the CMS watcher, only the SCRAPING logic differs):
-  1. Loads config.toml.
-  2. Loads the existing CSV of already-seen files (if present).
-  3. Scrapes the page for DIY-software entries (single-stage, keyword match).
-  4. Keeps only the entries NOT already in the CSV (new drops).
-  5. Stamps each new entry with the date it was found.
-  6. Appends the new rows to the CSV.
-  7. Alerts with details of ONLY the new entries (Teams / SMTP / Outlook).
-
 Run from a terminal:  python hhs_scraper.py [path/to/config.toml]
 On GitHub Actions:     python hhs_scraper.py   (uses cloudscraper + Teams)
 """
@@ -71,81 +62,118 @@ def get_html(session, url, cfg):
             time.sleep(2 * attempt)
 
 
+MONTHS = ("January|February|March|April|May|June|July|August|"
+          "September|October|November|December")
+DATE_RE = re.compile(rf"\b(?:{MONTHS})\s+\d{{1,2}},\s+\d{{4}}\b", re.IGNORECASE)
+
+
+def _norm(text):
+    """Normalize for matching: unify smart quotes, collapse spaces, lowercase."""
+    text = (text.replace("\u201c", '"').replace("\u201d", '"')
+                .replace("\u2018", "'").replace("\u2019", "'"))
+    return re.sub(r"\s+", " ", text).strip().lower()
+
+
 def scrape_matching_entries(html, page_url, cfg):
     """Single-stage scrape for HHS DIY software.
 
-    Finds every downloadable file link whose entry line matches the DIY
-    keyword, cleans the title to "date + <NNNN Benefit Year ...> Software"
-    (dropping trailing sub-items like Instructions/Technical/SAS), extracts
-    the benefit year, and returns ONE record per dated entry.
-
-    A single entry's <li> may hold several downloads (the DIY zip plus an
-    Instructions PDF, a Technical XLSX and a SAS-version zip); we keep just
-    one record per entry and prefer the DIY zip over the SAS zip.
+    The page lists each release as a DATE line followed by a HEADING line
+    ("<NNNN> Benefit Year ... Do It Yourself (DIY) ... Software"), usually with
+    sub-item download links (DIY zip, SAS zip, Instructions PDF, ...) nested
+    underneath.  We:
+      1. Scan the page TEXT line-by-line to capture EVERY dated DIY heading as
+         its own record (multiple per benefit year are kept separately).
+      2. Build a heading -> zip-URL map from the DOM (preferring the DIY zip
+         over a SAS-version zip) and attach a URL to each record.
 
     Returns list of {year, directory, file_name, file_ext, file_url}.
     """
     s = cfg["scraping"]
     exts = tuple(s["file_extensions"])
     keyword_re = re.compile(s["keyword_regex"], re.IGNORECASE)
-    year_re = re.compile(s["year_regex"])
     directory_label = s.get("directory_label", "HHS DIY Software")
 
     soup = BeautifulSoup(html, "html.parser")
-    by_title = {}   # cleaned_title -> record (dedupe per dated entry)
 
+    # ---- (A) Map each DIY heading to its best zip URL (from the DOM) --------
+    heading_url = {}   # normalized (date + heading) -> {"url":.., "sas":bool}
     for a in soup.find_all("a", href=True):
         href = a["href"]
         low = href.lower()
         is_file = low.endswith(exts) or "/files/" in low or "/document/" in low
         if not is_file:
             continue
-
-        # The link's whole entry line (li/p/td) carries the date + heading.
-        anchor_text = a.get_text(" ", strip=True)
-        parent = a.find_parent(["li", "p", "td", "div"])
-        context = parent.get_text(" ", strip=True) if parent else anchor_text
-        haystack = f"{anchor_text} | {context}"
-
-        # Only entries about the DIY software.
-        if not keyword_re.search(haystack):
+        h = a.find_previous(string=keyword_re)   # nearest DIY heading text
+        if not h:
             continue
+        heading = DATE_RE.sub("", str(h)).strip(" -\u2013:\t")
+        # Include the date preceding this heading so entries that share the
+        # same heading text (e.g. two releases in the same benefit year) get
+        # DISTINCT keys and keep their own zip URL.
+        dnode = h.find_previous(string=DATE_RE)
+        dmatch = DATE_RE.search(str(dnode)) if dnode else None
+        date_part = dmatch.group(0) if dmatch else ""
+        key = _norm(f"{date_part} {heading}")
+        if not key:
+            continue
+        is_sas = ("sas" in low) or ("sas" in a.get_text(" ", strip=True).lower())
+        cur = heading_url.get(key)
+        if cur is None:
+            heading_url[key] = {"url": urljoin(page_url, href), "sas": is_sas}
+        elif cur["sas"] and not is_sas:
+            heading_url[key] = {"url": urljoin(page_url, href), "sas": is_sas}
 
-        raw = context if len(context) >= len(anchor_text) else anchor_text
-        raw = " ".join(raw.split())
+    # ---- (B) Walk the page text to capture every dated DIY entry -----------
+    lines = [ln.strip() for ln in soup.get_text("\n").split("\n")]
+    lines = [ln for ln in lines if ln]
 
-        # Keep only "date + <NNNN Benefit Year ... Do It Yourself (DIY)> Software"
-        # and drop the trailing sub-items (Instructions/Technical/SAS/etc.).
-        m = re.search(r"^(.*?(?:do it yourself|\bdiy\b).{0,60}?software)\b",
-                      raw, re.IGNORECASE)
-        title = (m.group(1) if m else raw).strip()
+    recs, seen = [], set()
+    for i, ln in enumerate(lines):
+        # A heading line must mention the DIY software AND a benefit year.
+        if not keyword_re.search(ln) or "benefit year" not in ln.lower():
+            continue
+        heading = ln
 
-        # Benefit year: prefer the "NNNN Benefit Year" number over any other
-        # 20xx (CMS may post a benefit year's software in a later calendar year).
+        # Date: on the same line, else the nearest of the 2 preceding lines.
+        dm = DATE_RE.search(heading)
+        date_str = dm.group(0) if dm else ""
+        if not date_str:
+            for j in (i - 1, i - 2):
+                if j >= 0:
+                    dj = DATE_RE.search(lines[j])
+                    if dj and len(lines[j]) <= 40:
+                        date_str = dj.group(0)
+                        break
+
+        heading_only = DATE_RE.sub("", heading).strip(" -\u2013:\t")
+        heading_only = re.sub(r"\s+", " ", heading_only).strip()
+        title = f"{date_str} {heading_only}".strip() if date_str else heading_only
+
+        nk = _norm(title)
+        if nk in seen:
+            continue
+        seen.add(nk)
+
+        # Benefit year: prefer the "NNNN Benefit Year" number.
         by = re.search(r"(20\d{2})\s+Benefit\s+Year", title, re.IGNORECASE)
         if by:
             year = by.group(1)
         else:
-            ym = year_re.search(title) or year_re.search(haystack)
-            year = ym.group(1) if ym else ""
+            ym = re.search(r"20\d{2}", title)
+            year = ym.group(0) if ym else ""
 
-        ext = next((e for e in exts if low.endswith(e)), "")
-        url = urljoin(page_url, href)
+        # Attach a zip URL for this entry (keyed by date + heading so entries
+        # sharing a heading keep their own URL).
+        info = heading_url.get(_norm(title)) or heading_url.get(_norm(heading_only))
+        url = info["url"] if info else ""
+        ext = ""
+        if url:
+            ul = url.lower()
+            ext = next((e for e in exts if ul.endswith(e)), "")
 
-        # Prefer the DIY download over a SAS-version download in the same entry.
-        is_sas = ("sas" in low) or ("sas" in anchor_text.lower())
-        score = 0 if is_sas else 1
-
-        prev = by_title.get(title)
-        if prev is None or score > prev["_score"]:
-            by_title[title] = {"year": year, "directory": directory_label,
-                               "file_name": title, "file_ext": ext.lstrip("."),
-                               "file_url": url, "_score": score}
-
-    recs = []
-    for r in by_title.values():
-        r.pop("_score", None)
-        recs.append(r)
+        recs.append({"year": year, "directory": directory_label,
+                     "file_name": title, "file_ext": ext.lstrip("."),
+                     "file_url": url})
     return recs
 
 
@@ -178,17 +206,17 @@ def load_existing(csv_file):
 # ---------------------------------------------------------------------------
 def build_alert_body(new_rows, cfg):
     """Plain-text body listing ONLY the new entries - one separate block per
-    dated release (multiple releases per benefit year are listed individually,
-    never collapsed into a single per-year record)."""
+    dated release."""
     source = cfg["alert"].get("source_label", "the watched page")
     lines = [f"{len(new_rows)} new file(s) posted on {source}.", ""]
     for r in sorted(new_rows, key=lambda x: (x["year"], x["file_name"]),
                     reverse=True):
         lines.append(f"- {r['file_name']}")
-        lines.append(f"    Benefit year: {r['year'] or 'n/a'}"
-                     f"  |  {r['file_ext'] or 'file'}  |  found {r['date_found']}")
-        lines.append(f"    {r['file_url']}")
-        lines.append("")  # blank line between entries for readability
+        detail = f"    Benefit year: {r['year'] or 'n/a'}  |  found {r['date_found']}"
+        lines.append(detail)
+        if r["file_url"]:
+            lines.append(f"    {r['file_url']}")
+        lines.append("")  # blank line between entries
     lines += ["Page: " + cfg["scraping"]["main_url"]]
     return "\n".join(lines)
 
