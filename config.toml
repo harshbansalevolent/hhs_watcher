@@ -1,31 +1,16 @@
-# =============================================================================
-# HHS Risk Adjustment DIY Software Watcher - configuration
-# =============================================================================
-
 [scraping]
 base_url = "https://www.cms.gov"
 main_url = "https://www.cms.gov/marketplace/resources/regulations-guidance"
-
-# Match only the DIY-software entries (the "Do It Yourself" / "DIY" wording).
 keyword_regex = '(?i)(do it yourself|\bDIY\b).{0,60}software'
-
-# Extract the benefit year (first 20xx in the entry text)
 year_regex = '\b(20\d{2})\b'
-
-# DIY software ships as .zip
 file_extensions = [".zip"]
-
-# Written into the CSV "directory" column (kept for schema parity)
 directory_label = "HHS DIY Software"
-
 retries = 3
 request_delay = 1
 timeout = 30
 
-
 [storage]
 csv_file = "hhs_files.csv"
-
 
 [alert]
 enabled = true
@@ -34,14 +19,12 @@ to = ["harsh.bansal@evolenthealth.com"]
 subject = "New HHS DIY Risk Adjustment Software posted"
 source_label = "the CMS Marketplace Regulations & Guidance page (HHS DIY Software)"
 
-
 [alert.smtp]
 host = "smtp.sendgrid.net"
 port = 587
 from_address = "hhs-watcher@yourdomain.com"
 use_tls = true
 use_auth = true
-
 
 [http]
 user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
