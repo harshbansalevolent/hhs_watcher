@@ -2,7 +2,7 @@ name: hhs_watcher
 
 on:
   schedule:
-    - cron: "0 13 */2 * *"     # every 2 days at 13:00 UTC = 9 AM ET
+    - cron: "0 13 */2 3,4,7,8 *"   # every 2 days at 13:00 UTC (9 AM ET), only in Mar, Apr, Jul, Aug
   workflow_dispatch:
 
 permissions:
